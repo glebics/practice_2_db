@@ -1,12 +1,15 @@
+from models import SpimexTradingResult
+from database import Base, engine
 import re
 import os
 import requests
 import logging
 from bs4 import BeautifulSoup
 from datetime import datetime
-from database import get_db
+from database import get_db, SessionLocal
 from sqlalchemy.orm import Session
 import pandas as pd
+from sqlalchemy import text
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -15,6 +18,9 @@ REPORTS_DIR = "reports"
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
 BASE_URL = "https://spimex.com/markets/oil_products/trades/results/"
+
+# Создаем таблицы в базе данных, если они еще не существуют
+Base.metadata.create_all(bind=engine)
 
 
 def calculate_months_limit():
@@ -78,6 +84,17 @@ def extract_trade_date(file_path):
         return None
 
 
+def report_exists(date):
+    file_path = os.path.join(REPORTS_DIR, f"{date}.xls")
+    return os.path.exists(file_path)
+
+
+def is_report_in_db(report_date, db: Session):
+    query = text("SELECT 1 FROM spimex_trading_results WHERE date = :date")
+    result = db.execute(query, {"date": report_date}).fetchone()
+    return result is not None
+
+
 def download_report(url, index):
     response = requests.get(url)
     if response.status_code == 200:
@@ -88,27 +105,141 @@ def download_report(url, index):
         report_date = extract_trade_date(temp_file_path)
 
         if report_date:
+            if report_exists(report_date):
+                logging.info(
+                    f"Отчет за {report_date} уже существует. Пропуск скачивания.")
+                os.remove(temp_file_path)
+                return None
+
             final_file_path = os.path.join(REPORTS_DIR, f"{report_date}.xls")
             os.rename(temp_file_path, final_file_path)
             logging.info(f"Файл сохранен: {final_file_path}")
+            return final_file_path
         else:
             os.remove(temp_file_path)
             logging.warning(
                 f"Файл {temp_file_path} удален из-за отсутствия даты.")
+            return None
     else:
         logging.error(
             f"Ошибка скачивания файла по ссылке {url}. Код ответа: {response.status_code}")
+        return None
+
+
+def save_report_to_db(file_path, db: Session):
+    try:
+        logging.info(
+            f"Начало обработки файла '{file_path}' для записи в базу данных.")
+
+        # Читаем данные с пропуском первых 6 строк, начиная с 7-й строки как заголовок
+        df = pd.read_excel(file_path, skiprows=6)
+
+        # Применяем ffill() для корректной обработки объединенных названий
+        df.columns = df.columns.to_series().ffill()
+        logging.info(f"Столбцы после пропуска строк: {df.columns.tolist()}")
+
+        # Отобразим все значения в первых нескольких строках, чтобы понять структуру данных
+        logging.info(f"Превью данных:\n{df.head()}")
+
+        # Создаём маппинг текущих и нужных названий
+        column_mapping = {
+            'Код\nИнструмента': 'exchange_product_id',
+            'Наименование\nИнструмента': 'exchange_product_name',
+            'Базис\nпоставки': 'delivery_basis_id',
+            'Объем\nДоговоров\nв единицах\nизмерения': 'volume',
+            'Обьем\nДоговоров,\nруб.': 'total',
+            'Цена в Заявках (за единицу\nизмерения)': 'delivery_type_id',
+            'Количество\nДоговоров,\nшт.': 'count',
+            # Добавьте аналогичные маппинги для других ожидаемых столбцов
+        }
+
+        # Переименовываем столбцы
+        df.rename(columns=column_mapping, inplace=True)
+        logging.info(f"Столбцы после переименования: {df.columns.tolist()}")
+
+        # Проверка наличия необходимых столбцов после переименования
+        required_columns = list(column_mapping.values())
+        missing_columns = [
+            col for col in required_columns if col not in df.columns]
+
+        if missing_columns:
+            logging.warning(
+                f"В файле '{file_path}' отсутствуют столбцы: {missing_columns}")
+            return
+
+        # Оставляем только нужные столбцы
+        df = df[required_columns]
+
+        # Запись данных в базу
+        for _, row in df.iterrows():
+            report_data = {
+                "exchange_product_id": row['exchange_product_id'],
+                "exchange_product_name": row['exchange_product_name'],
+                # Извлекаем первые 4 символа
+                "oil_id": row['exchange_product_id'][:4],
+                "delivery_basis_id": row['delivery_basis_id'],
+                "delivery_basis_name": "",  # Если данные отсутствуют, оставьте пустым
+                "delivery_type_id": row['delivery_type_id'],
+                "volume": row['volume'],
+                "total": row['total'],
+                "count": row['count'],
+                "date": datetime.strptime(file_path.split("/")[-1].replace(".xls", ""), "%Y-%m-%d")
+            }
+            logging.info(f"Запись в базу данных: {report_data}")
+            db.execute(
+                """
+                INSERT INTO spimex_trading_results (exchange_product_id, exchange_product_name, oil_id, delivery_basis_id, 
+                                                    delivery_basis_name, delivery_type_id, volume, total, count, date)
+                VALUES (:exchange_product_id, :exchange_product_name, :oil_id, :delivery_basis_id, 
+                        :delivery_basis_name, :delivery_type_id, :volume, :total, :count, :date)
+                """, report_data
+            )
+        db.commit()
+        logging.info(
+            f"Данные из файла '{file_path}' успешно сохранены в базу данных.")
+
+    except Exception as e:
+        logging.error(
+            f"Ошибка при сохранении данных из файла '{file_path}' в базу данных: {e}")
 
 
 def main():
     logging.info("Начало работы программы.")
     report_links = fetch_report_links()
 
-    for i, url in enumerate(report_links, start=1):
-        logging.info(f"Скачивание отчета {i} из {len(report_links)}")
-        download_report(url, i)
+    db = SessionLocal()
+    try:
+        for i, url in enumerate(report_links, start=1):
+            logging.info(f"Скачивание отчета {i} из {len(report_links)}")
+            file_path = download_report(url, i)
 
-    logging.info("Завершение работы программы.")
+            if file_path:
+                report_date = extract_trade_date(file_path)
+
+                if report_date and not is_report_in_db(report_date, db):
+                    logging.info(
+                        f"Начало обработки и записи в базу данных для файла '{file_path}'")
+                    save_report_to_db(file_path, db)
+                else:
+                    logging.info(
+                        f"Отчет за {report_date} уже существует в базе данных. Пропуск записи.")
+
+        # Проверка и запись всех файлов в папке 'reports'
+        for filename in os.listdir(REPORTS_DIR):
+            file_path = os.path.join(REPORTS_DIR, filename)
+            report_date = extract_trade_date(file_path)
+
+            if report_date and not is_report_in_db(report_date, db):
+                logging.info(
+                    f"Начало обработки и записи в базу данных для файла '{file_path}'")
+                save_report_to_db(file_path, db)
+            else:
+                logging.info(
+                    f"Отчет за {report_date} уже существует в базе данных. Пропуск записи.")
+
+    finally:
+        db.close()
+        logging.info("Завершение работы программы.")
 
 
 if __name__ == "__main__":
