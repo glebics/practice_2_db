@@ -131,17 +131,17 @@ def save_report_to_db(file_path, db: Session):
         logging.info(
             f"Начало обработки файла '{file_path}' для записи в базу данных.")
 
-        # Читаем данные с пропуском первых 6 строк, начиная с 7-й строки как заголовок
+        # Читаем данные, начиная с 7-й строки как заголовок
         df = pd.read_excel(file_path, skiprows=6)
 
-        # Применяем ffill() для корректной обработки объединенных названий
+        # Обрабатываем объединенные названия и заменяем NaN на пустую строку
         df.columns = df.columns.to_series().ffill()
-        logging.info(f"Столбцы после пропуска строк: {df.columns.tolist()}")
+        df = df.fillna('')
 
-        # Отобразим все значения в первых нескольких строках, чтобы понять структуру данных
+        logging.info(f"Столбцы после пропуска строк: {df.columns.tolist()}")
         logging.info(f"Превью данных:\n{df.head()}")
 
-        # Создаём маппинг текущих и нужных названий
+        # Маппинг для переименования
         column_mapping = {
             'Код\nИнструмента': 'exchange_product_id',
             'Наименование\nИнструмента': 'exchange_product_name',
@@ -150,14 +150,11 @@ def save_report_to_db(file_path, db: Session):
             'Обьем\nДоговоров,\nруб.': 'total',
             'Цена в Заявках (за единицу\nизмерения)': 'delivery_type_id',
             'Количество\nДоговоров,\nшт.': 'count',
-            # Добавьте аналогичные маппинги для других ожидаемых столбцов
         }
 
-        # Переименовываем столбцы
         df.rename(columns=column_mapping, inplace=True)
         logging.info(f"Столбцы после переименования: {df.columns.tolist()}")
 
-        # Проверка наличия необходимых столбцов после переименования
         required_columns = list(column_mapping.values())
         missing_columns = [
             col for col in required_columns if col not in df.columns]
@@ -167,32 +164,44 @@ def save_report_to_db(file_path, db: Session):
                 f"В файле '{file_path}' отсутствуют столбцы: {missing_columns}")
             return
 
-        # Оставляем только нужные столбцы
+        # Оставляем нужные столбцы
         df = df[required_columns]
 
-        # Запись данных в базу
+        # Преобразование дефисов и пустых значений в None
+        df.replace({'-': None, '': None}, inplace=True)
+
+        # Фильтрация строки "Итого" и пропуск строк с None в обязательных полях
+        df = df[~df['exchange_product_id'].str.contains('Итого', na=False)]
+        df.dropna(subset=['exchange_product_id',
+                  'exchange_product_name', 'delivery_basis_id'], inplace=True)
+
+        # Обрабатываем и записываем данные в базу данных
         for _, row in df.iterrows():
+            if not row['exchange_product_id']:  # Пропуск пустых строк
+                continue
+
             report_data = {
                 "exchange_product_id": row['exchange_product_id'],
                 "exchange_product_name": row['exchange_product_name'],
-                # Извлекаем первые 4 символа
-                "oil_id": row['exchange_product_id'][:4],
+                "oil_id": row['exchange_product_id'][:4] if isinstance(row['exchange_product_id'], str) else None,
                 "delivery_basis_id": row['delivery_basis_id'],
-                "delivery_basis_name": "",  # Если данные отсутствуют, оставьте пустым
-                "delivery_type_id": row['delivery_type_id'],
-                "volume": row['volume'],
-                "total": row['total'],
-                "count": row['count'],
+                "delivery_basis_name": "",  # Оставьте пустым при отсутствии данных
+                "delivery_type_id": try_convert_to_float(row['delivery_type_id']),
+                "volume": try_convert_to_float(row['volume']),
+                "total": try_convert_to_float(row['total']),
+                "count": try_convert_to_int(row['count']),
                 "date": datetime.strptime(file_path.split("/")[-1].replace(".xls", ""), "%Y-%m-%d")
             }
             logging.info(f"Запись в базу данных: {report_data}")
             db.execute(
-                """
-                INSERT INTO spimex_trading_results (exchange_product_id, exchange_product_name, oil_id, delivery_basis_id, 
-                                                    delivery_basis_name, delivery_type_id, volume, total, count, date)
-                VALUES (:exchange_product_id, :exchange_product_name, :oil_id, :delivery_basis_id, 
-                        :delivery_basis_name, :delivery_type_id, :volume, :total, :count, :date)
-                """, report_data
+                text(
+                    """
+                    INSERT INTO spimex_trading_results (exchange_product_id, exchange_product_name, oil_id, delivery_basis_id, 
+                                                        delivery_basis_name, delivery_type_id, volume, total, count, date)
+                    VALUES (:exchange_product_id, :exchange_product_name, :oil_id, :delivery_basis_id, 
+                            :delivery_basis_name, :delivery_type_id, :volume, :total, :count, :date)
+                    """
+                ), report_data
             )
         db.commit()
         logging.info(
@@ -201,6 +210,21 @@ def save_report_to_db(file_path, db: Session):
     except Exception as e:
         logging.error(
             f"Ошибка при сохранении данных из файла '{file_path}' в базу данных: {e}")
+        db.rollback()
+
+
+def try_convert_to_float(value):
+    try:
+        return float(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def try_convert_to_int(value):
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
 
 
 def main():
